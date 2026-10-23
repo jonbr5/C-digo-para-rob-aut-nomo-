@@ -1,0 +1,126 @@
+
+<?php
+
+/**
+ * Atualiza o estado de um chamado com controle de concorrência.
+ *
+ * Requer PDO e MySQL com tabelas InnoDB.
+ */
+function alterarEstadoChamado(
+    PDO $pdo,
+    int $chamadoId,
+    string $novoEstado,
+    ?int $atendenteId
+): array {
+    $estadosPermitidos = [
+        'aberto',
+        'em_atendimento',
+        'concluido',
+        'cancelado'
+    ];
+
+    if (!in_array($novoEstado, $estadosPermitidos, true)) {
+        throw new InvalidArgumentException('Estado inválido.');
+    }
+
+    try {
+        $pdo->beginTransaction();
+
+        // Bloqueia a linha para evitar alterações simultâneas conflitantes.
+        $sql = "SELECT id, status, atendente_id
+                FROM chamados
+                WHERE id = :id
+                FOR UPDATE";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute(['id' => $chamadoId]);
+
+        $chamado = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$chamado) {
+            throw new RuntimeException('Chamado não encontrado.');
+        }
+
+        $estadoAtual = $chamado['status'];
+        $atendenteAtual = $chamado['atendente_id'];
+
+        // Define quais transições de estado são permitidas.
+        $transicoes = [
+            'aberto' => ['em_atendimento', 'cancelado'],
+            'em_atendimento' => ['concluido', 'cancelado'],
+            'concluido' => [],
+            'cancelado' => []
+        ];
+
+        if (!in_array(
+            $novoEstado,
+            $transicoes[$estadoAtual] ?? [],
+            true
+        )) {
+            throw new RuntimeException(
+                "Não é permitido mudar de '$estadoAtual' para '$novoEstado'."
+            );
+        }
+
+        // Impede que um segundo atendente assuma um chamado já ocupado.
+        if ($novoEstado === 'em_atendimento') {
+            if ($atendenteId === null) {
+                throw new InvalidArgumentException(
+                    'Informe o atendente responsável.'
+                );
+            }
+
+            if ($atendenteAtual !== null) {
+                throw new RuntimeException(
+                    'O chamado já possui um atendente.'
+                );
+            }
+        }
+
+        // Só o atendente responsável pode concluir ou cancelar
+        // um chamado em atendimento.
+        if ($estadoAtual === 'em_atendimento') {
+            if (
+                $atendenteId === null ||
+                (int) $atendenteAtual !== $atendenteId
+            ) {
+                throw new RuntimeException(
+                    'Você não é o responsável por este chamado.'
+                );
+            }
+        }
+
+        $novoAtendente = $novoEstado === 'em_atendimento'
+            ? $atendenteId
+            : $atendenteAtual;
+
+        $sql = "UPDATE chamados
+                SET status = :status,
+                    atendente_id = :atendente_id,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = :id";
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([
+            'status' => $novoEstado,
+            'atendente_id' => $novoAtendente,
+            'id' => $chamadoId
+        ]);
+
+        $pdo->commit();
+
+        return [
+            'sucesso' => true,
+            'mensagem' => 'Chamado atualizado com sucesso.',
+            'estado_anterior' => $estadoAtual,
+            'estado_atual' => $novoEstado
+        ];
+
+    } catch (Throwable $e) {
+        if ($pdo->inTransaction()) {
+            $pdo->rollBack();
+        }
+
+        throw $e;
+    }
+}
